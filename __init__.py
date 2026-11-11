@@ -44,24 +44,45 @@ def _settings(ctx):
     return Settings.from_getter(get)
 
 
+def _terminal_setting(name: str, default: str) -> str:
+    """Scope-aware TERMINAL_* read (per-profile under gateway multiplexing)."""
+    try:
+        from tools.terminal_scope import terminal_env
+        return terminal_env(name, default) or default
+    except Exception:
+        return os.environ.get(name, default) or default
+
+
+def _backend(task_id: str = "") -> str:
+    """Terminal backend for this call. Counts only run when it is ``local``."""
+    if task_id:
+        try:
+            from tools.terminal_tool import _qualify_task_key, _task_env_overrides
+            env_type = (_task_env_overrides.get(_qualify_task_key(task_id)) or {}).get("env_type")
+            if env_type:
+                return str(env_type).strip().lower()
+        except Exception:
+            pass
+    return _terminal_setting("TERMINAL_ENV", "local").strip().lower()
+
+
 def _cwd() -> str:
-    for key in ("TERMINAL_CWD",):
-        v = os.environ.get(key)
-        if v and os.path.isdir(os.path.expanduser(v)):
-            return os.path.abspath(os.path.expanduser(v))
+    v = _terminal_setting("TERMINAL_CWD", "")
+    if v and os.path.isdir(os.path.expanduser(v)):
+        return os.path.abspath(os.path.expanduser(v))
     try:
         return os.getcwd()
     except OSError:
         return os.path.expanduser("~")
 
 
-def _on_pre_tool_call(ctx, tool_name: str = "", args: Any = None, **_kw):
+def _on_pre_tool_call(ctx, tool_name: str = "", args: Any = None, task_id: str = "", **_kw):
     from .sqldryrun.extract import from_tool_call
     from .sqldryrun.policy import assess_all, directive
 
     if not isinstance(args, dict):
         return None
-    sources = from_tool_call(tool_name, args, _cwd())
+    sources = from_tool_call(tool_name, args, _cwd(), backend=_backend(task_id))
     if not sources:
         return None
     settings = _settings(ctx)
@@ -75,13 +96,12 @@ def _on_pre_tool_call(ctx, tool_name: str = "", args: Any = None, **_kw):
 
 
 def _handle_sql_impact(ctx, sql: str = "", command: str = "", sqlite_db: str = "",
-                       workdir: str = "", **_kw) -> str:
-    from .sqldryrun.extract import SqlSource, Target, from_command, _resolve
+                       workdir: str = "", task_id: str = "", **_kw) -> str:
+    from .sqldryrun.extract import SqlSource, Target, from_command, restrict_to_backend, _resolve
     from .sqldryrun.policy import assess_all
 
-    base = _cwd()
-    if workdir:
-        base = _resolve(workdir, base)
+    cwd = _cwd()
+    base = _resolve(workdir, cwd) if workdir else cwd
     if command:
         sources = from_command(command, base)
     elif sql:
@@ -90,6 +110,11 @@ def _handle_sql_impact(ctx, sql: str = "", command: str = "", sqlite_db: str = "
                              origin=f"sqlite3 {sqlite_db}" if sqlite_db else "sql")]
     else:
         return json.dumps({"error": "pass `sql` (optionally with `sqlite_db`) or a full shell `command`"})
+    # Same rules as the hook: working-tree clients refused, host counts only on a local backend.
+    for s in sources:
+        if s.target:
+            s.target.tree = list({*s.target.tree, base, cwd})
+    restrict_to_backend(sources, _backend(task_id))
     settings = _settings(ctx)
     results = [a.to_dict() for a in assess_all(sources, settings)]
     if not results:
@@ -136,7 +161,8 @@ def register(ctx):
                 },
             },
         },
-        handler=lambda args, **kw: _handle_sql_impact(ctx, **(args or {})),
+        handler=lambda args, **kw: _handle_sql_impact(ctx, task_id=str(kw.get("task_id") or ""),
+                                                       **{k: v for k, v in (args or {}).items() if k != "task_id"}),
         description="Read-only row-impact check for DELETE/UPDATE/DROP/TRUNCATE",
         emoji="🧮",
     )

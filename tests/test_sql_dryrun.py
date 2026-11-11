@@ -122,9 +122,10 @@ def test_extract_clients(tmp_path):
     s = from_command("sqlite3 -header shop.db \"DELETE FROM orders\"", str(tmp_path))[0]
     assert s.target.engine == "sqlite" and s.target.db_path == str(tmp_path / "shop.db")
     s = from_command('PGPASSWORD=x psql -h db -U app shop -c "UPDATE users SET active=0"', "/")[0]
-    assert s.target.engine == "postgres" and s.target.conn_args == ["-h", "db", "-U", "app", "shop"]
+    assert s.target.engine == "postgres" and s.target.conn_args == ["--host=db", "--username=app", "shop"]
+    assert s.target.env == {"PGPASSWORD": "x"} and not s.target.uncountable
     s = from_command("mysql -u root shop -e 'TRUNCATE logs'", "/")[0]
-    assert s.target.engine == "mysql" and s.target.conn_args == ["-u", "root", "shop"]
+    assert s.target.engine == "mysql" and s.target.conn_args == ["--user=root", "--database=shop"]
 
 
 def test_extract_heredoc_and_pipe(tmp_path):
@@ -200,3 +201,116 @@ def test_sql_impact_tool(ctx, shop):
 def test_command_lists_recent(ctx, shop):
     hook(ctx, "sqlite3 shop.db \"UPDATE users SET active=0\"")
     assert "UPDATE users SET active=0" in ctx.commands["sql-dryrun"]("")
+
+
+# ── review fixes (PR #153457) ─────────────────────────────────────────────
+
+from sql_dryrun_under_test.sqldryrun.count import minimal_env, resolve_client  # noqa: E402
+from sql_dryrun_under_test.sqldryrun.extract import Target  # noqa: E402
+
+
+# 1. which binary runs
+@pytest.mark.parametrize("cmd", [
+    './psql shop -c "DELETE FROM users"',
+    '/tmp/evil/psql shop -c "DELETE FROM users"',
+    'bin/mysql shop -e "DELETE FROM users"',
+])
+def test_client_given_as_path_is_never_run(cmd, tmp_path):
+    src = from_command(cmd, str(tmp_path))[0]
+    path, why = resolve_client(src.target)
+    assert path is None and "bare" in why
+
+
+def test_client_on_path_inside_working_tree_is_refused(tmp_path, monkeypatch):
+    fake = tmp_path / "bin" / "psql"
+    fake.parent.mkdir()
+    marker = tmp_path / "ran"
+    fake.write_text(f"#!/bin/sh\ntouch {marker}\necho on; echo 5; echo 5\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake.parent}:/usr/bin:/bin")
+    c = FakeCtx()
+    plugin.register(c)
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    d = hook(c, 'psql shop -c "DELETE FROM users"')
+    assert d["action"] == "approve" and "no WHERE" in d["message"]   # still flagged by shape
+    assert not marker.exists()                                          # the planted binary never ran
+    path, why = resolve_client(Target(engine="postgres", client="psql", tree=[str(tmp_path)]))
+    assert path is None and "inside the working tree" in why
+
+
+def test_sql_impact_tool_uses_same_client_rules(ctx, tmp_path, monkeypatch):
+    marker = tmp_path / "ran"
+    fake = tmp_path / "mysql"
+    fake.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    out = json.loads(ctx.tools["sql_impact"]({"command": './mysql shop -e "DELETE FROM t WHERE id > 1"'}))
+    assert "not counted" in out["statements"][0]["count_note"] and not marker.exists()
+
+
+# 2. environment
+def test_minimal_env_drops_secrets(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret")
+    monkeypatch.setenv("PGHOST", "db")
+    monkeypatch.setenv("PGOPTIONS", "-c default_transaction_read_only=off")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    monkeypatch.setenv("MYSQL_PWD", "pw")
+    pg = minimal_env(Target(engine="postgres", env={"PGPASSWORD": "x"}))
+    assert pg["PGHOST"] == "db" and pg["PGPASSWORD"] == "x" and pg["LC_ALL"] == "C.UTF-8"
+    assert "ANTHROPIC_API_KEY" not in pg and "OPENROUTER_API_KEY" not in pg
+    assert "PGOPTIONS" not in pg and "MYSQL_PWD" not in pg
+    my = minimal_env(Target(engine="mysql"))
+    assert my["MYSQL_PWD"] == "pw" and "PGHOST" not in my and "ANTHROPIC_API_KEY" not in my
+
+
+def test_env_prefix_pgoptions_is_not_taken():
+    s = from_command('PGOPTIONS="-c default_transaction_read_only=off" psql shop -c "DELETE FROM t"', "/")[0]
+    assert "PGOPTIONS" not in s.target.env
+
+
+# 3. connection args can't break the read-only session
+@pytest.mark.parametrize("cmd,reason", [
+    ('mysql --init-command="SET autocommit=1" shop -e "DELETE FROM t"', "allowlist"),
+    ('mysql --defaults-extra-file=x.cnf shop -e "DELETE FROM t"', "allowlist"),
+    ('mysql -p shop -e "DELETE FROM t"', "password"),
+    ("psql \"host=db dbname=shop options='-c default_transaction_read_only=off'\" -c \"DELETE FROM t\"",
+     "options="),
+    ('psql "postgresql://db/shop?options=-c%20x" -c "DELETE FROM t"', "options="),
+    ('psql -d "dbname=shop options=x" -c "DELETE FROM t"', "options="),
+    ('psql --set=FOO=1 --pset=x -o out.txt -W shop -c "DELETE FROM t"', "allowlist"),
+    ('psql "$OTHER_VAR" -c "DELETE FROM t"', "OTHER_VAR"),
+])
+def test_unsafe_connection_args_skip_the_count(cmd, reason):
+    t = from_command(cmd, "/")[0].target
+    assert t.uncountable and reason in t.uncountable
+
+
+def test_allowed_connection_args():
+    t = from_command('mysql -hdb -P3306 -uroot -psecret --socket=/run/m.sock shop -e "DELETE FROM t"', "/")[0].target
+    assert not t.uncountable
+    assert t.conn_args == ["--password=secret", "--host=db", "--port=3306", "--user=root",
+                           "--socket=/run/m.sock", "--database=shop"]
+    t = from_command('psql -qAt -h db -p 5432 -U app -d shop -c "DELETE FROM t"', "/")[0].target
+    assert not t.uncountable and t.conn_args == ["--host=db", "--port=5432", "--username=app", "--dbname=shop"]
+
+
+def test_database_url_is_expanded(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://app@db/shop")
+    t = from_command('psql "$DATABASE_URL" -c "DELETE FROM t"', "/")[0].target
+    assert not t.uncountable and t.conn_args == ["postgresql://app@db/shop"]
+    monkeypatch.setenv("DATABASE_URL", "postgresql://db/shop?options=-c%20x")
+    assert "options=" in from_command('psql "$DATABASE_URL" -c "DELETE FROM t"', "/")[0].target.uncountable
+
+
+# 4. only count on the local backend
+@pytest.mark.parametrize("backend", ["docker", "ssh", "modal", "daytona"])
+def test_non_local_backend_flags_by_shape_only(shop, monkeypatch, backend):
+    monkeypatch.setenv("TERMINAL_ENV", backend)
+    c = FakeCtx()
+    plugin.register(c)
+    d = hook(c, "sqlite3 shop.db \"UPDATE users SET active=0\"")
+    assert d["action"] == "approve" and "no WHERE" in d["message"] and "500" not in d["message"]
+    assert hook(c, "sqlite3 shop.db \"DELETE FROM orders WHERE created_at < '2030-01-01'\"") is None
+    out = json.loads(c.tools["sql_impact"]({"sql": "DELETE FROM users WHERE id < 9", "sqlite_db": "shop.db"}))
+    assert backend in out["statements"][0]["count_note"]

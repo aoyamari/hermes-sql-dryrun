@@ -65,7 +65,17 @@ hermes plugins enable sql-dryrun
 
 ## Disclosure
 
-Reads the tool arguments of `terminal`, `execute_code` and tools with a `sql`/`query`/`statement` argument. When a destructive statement targets a database it can reach, it runs **read-only** `SELECT COUNT(*)` queries against it: SQLite in-process (`mode=ro`), Postgres/MySQL by running the same client (`psql`/`mysql`/`mariadb`) with the same connection flags the agent used, in a read-only session, with a timeout and no password prompt. No network calls of its own, no files written, no data changed, nothing sent to a model provider beyond the approval message Hermes shows. Not counted: statements with CTEs or joins (`USING`, `UPDATE … FROM`, multi-table) — those are still flagged by shape.
+Reads the tool arguments of `terminal`, `execute_code` and tools with a `sql`/`query`/`statement` argument. When a destructive statement targets a database it can reach, it runs **read-only** `SELECT COUNT(*)` queries against it:
+
+- **SQLite** — in-process, `mode=ro`, `trusted_schema=OFF`.
+- **Postgres / MySQL / MariaDB** — the system client, under strict rules:
+  - **Which binary:** only a bare `psql` / `mysql` / `mariadb` token, resolved with `shutil.which()`. A path (`./psql`, `/tmp/x/psql`) or a PATH hit inside the agent's working tree is never run — the statement is flagged by shape instead.
+  - **Which environment:** `PATH`, `HOME`, `LANG`, `LC_*`, `TZ`, plus libpq `PG*` variables (never `PGOPTIONS`) or `MYSQL_PWD` / `MYSQL_HOST` / `MYSQL_TCP_PORT` / `MYSQL_UNIX_PORT`. No provider API keys or anything else. `$DATABASE_URL` is expanded only when it is the whole argument.
+  - **Which flags:** connection flags only (`psql -h -p -U -d`, a dbname/URI; `mysql -h -P -u -D -S --defaults-file -pVALUE`, a database). Any other flag, a conninfo/URI with `options=`, a password prompt, or a `--defaults-file` inside the working tree → no count.
+  - **Read-only, checked:** Postgres runs `BEGIN TRANSACTION READ ONLY`, then `SHOW transaction_read_only` must return `on` before any count is trusted; `PGOPTIONS` is set by the plugin, not inherited. MySQL runs inside `START TRANSACTION READ ONLY … ROLLBACK`. Both with a timeout and no password prompt.
+- **Where:** counts only run when the terminal backend is `local`. On docker / ssh / modal / daytona the host's database isn't the sandbox's, so statements are flagged by shape only.
+
+No network calls of its own, no files written, no data changed, nothing stored; the flagged SQL appears in the approval message. Not counted: statements with CTEs or joins (`USING`, `UPDATE … FROM`, multi-table) — those are still flagged by shape.
 
 ## Tests
 

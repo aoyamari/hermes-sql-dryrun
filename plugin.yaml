@@ -1,0 +1,32 @@
+name: sql-dryrun
+version: 0.1.0
+description: "Shows how many rows a DELETE/UPDATE/DROP/TRUNCATE will touch before it runs, and asks for approval when it is too many — catches UPDATE without WHERE, WHERE 1=1, and WHERE clauses that match the whole table"
+author: Aoyama
+maintainer: Aoyama
+license: MIT
+requires_hermes: ">=0.23.0"
+
+provides_hooks:
+  - pre_tool_call
+provides_tools:
+  - sql_impact
+provides_commands:
+  - sql-dryrun
+
+config_schema:
+  row_threshold:
+    type: int
+    default: 100
+    description: "A WHERE-qualified DELETE/UPDATE touching more rows than this needs approval"
+  mode:
+    type: str
+    default: approve
+    description: "approve = send flagged SQL to Hermes' approval prompt; block = refuse it outright"
+  count_timeout_seconds:
+    type: float
+    default: 5.0
+    description: "Max seconds for the read-only COUNT(*) query (0.5-20)"
+  flag_uncounted:
+    type: bool
+    default: false
+    description: "Also ask approval for WHERE-qualified statements whose rows could not be counted"

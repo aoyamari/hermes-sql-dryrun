@@ -44,32 +44,26 @@ def _settings(ctx):
     return Settings.from_getter(get)
 
 
-def _terminal_setting(name: str, default: str) -> str:
-    """Scope-aware TERMINAL_* read (per-profile under gateway multiplexing)."""
+def _backend() -> str:
+    """Configured terminal backend (``terminal.backend``). Counts only run when it is ``local``.
+
+    Read through the public config API. If it can't be read, the answer is
+    ``unknown`` and nothing is counted (statements are still flagged by shape).
+    """
     try:
-        from tools.terminal_scope import terminal_env
-        return terminal_env(name, default) or default
+        from hermes_cli.config import load_config_readonly
+        backend = (load_config_readonly().get("terminal") or {}).get("backend")
     except Exception:
-        return os.environ.get(name, default) or default
-
-
-def _backend(task_id: str = "") -> str:
-    """Terminal backend for this call. Counts only run when it is ``local``."""
-    if task_id:
-        try:
-            from tools.terminal_tool import _qualify_task_key, _task_env_overrides
-            env_type = (_task_env_overrides.get(_qualify_task_key(task_id)) or {}).get("env_type")
-            if env_type:
-                return str(env_type).strip().lower()
-        except Exception:
-            pass
-    return _terminal_setting("TERMINAL_ENV", "local").strip().lower()
+        return "unknown"
+    return str(backend or "local").strip().lower()
 
 
 def _cwd() -> str:
-    v = _terminal_setting("TERMINAL_CWD", "")
-    if v and os.path.isdir(os.path.expanduser(v)):
-        return os.path.abspath(os.path.expanduser(v))
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+        return str(resolve_agent_cwd())
+    except Exception:
+        pass
     try:
         return os.getcwd()
     except OSError:
@@ -82,7 +76,7 @@ def _on_pre_tool_call(ctx, tool_name: str = "", args: Any = None, task_id: str =
 
     if not isinstance(args, dict):
         return None
-    sources = from_tool_call(tool_name, args, _cwd(), backend=_backend(task_id))
+    sources = from_tool_call(tool_name, args, _cwd(), backend=_backend())
     if not sources:
         return None
     settings = _settings(ctx)
@@ -114,7 +108,7 @@ def _handle_sql_impact(ctx, sql: str = "", command: str = "", sqlite_db: str = "
     for s in sources:
         if s.target:
             s.target.tree = list({*s.target.tree, base, cwd})
-    restrict_to_backend(sources, _backend(task_id))
+    restrict_to_backend(sources, _backend())
     settings = _settings(ctx)
     results = [a.to_dict() for a in assess_all(sources, settings)]
     if not results:

@@ -71,9 +71,10 @@ Reads the tool arguments of `terminal`, `execute_code` and tools with a `sql`/`q
 - **Postgres / MySQL / MariaDB** — the system client, under strict rules:
   - **Which binary:** only a bare `psql` / `mysql` / `mariadb` token, resolved with `shutil.which()`. A path (`./psql`, `/tmp/x/psql`) or a PATH hit inside the agent's working tree is never run — the statement is flagged by shape instead.
   - **Which environment:** `PATH`, `HOME`, `LANG`, `LC_*`, `TZ`, plus libpq `PG*` variables (never `PGOPTIONS`) or `MYSQL_PWD` / `MYSQL_HOST` / `MYSQL_TCP_PORT` / `MYSQL_UNIX_PORT`. No provider API keys or anything else. `$DATABASE_URL` is expanded only when it is the whole argument.
-  - **Which flags:** connection flags only (`psql -h -p -U -d`, a dbname/URI; `mysql -h -P -u -D -S --defaults-file -pVALUE`, a database). Any other flag, a conninfo/URI with `options=`, a password prompt, or a `--defaults-file` inside the working tree → no count.
+  - **Which flags:** connection flags only (`psql -h -p -U -d`, a dbname/URI; `mysql -h -P -u -D -S -pVALUE`, a database). Any other flag (including `--defaults-file`), a conninfo/URI with `options=`, or a password prompt → no count. MySQL always runs with `--no-defaults`, so no option file can add an `init-command`.
   - **Read-only, checked:** Postgres runs `BEGIN TRANSACTION READ ONLY`, then `SHOW transaction_read_only` must return `on` before any count is trusted; `PGOPTIONS` is set by the plugin, not inherited. MySQL runs inside `START TRANSACTION READ ONLY … ROLLBACK`. Both with a timeout and no password prompt.
-- **Where:** counts only run when the terminal backend is `local`. On docker / ssh / modal / daytona the host's database isn't the sandbox's, so statements are flagged by shape only.
+- **One statement only:** if the statement contains a `;` or a backslash anywhere, it is never sent to a database — it goes to the approval prompt uncounted. Servers disagree on what `\\'` means, so the text can't be trusted to stay one statement.
+- **Where:** counts only run when `terminal.backend` (read through `hermes_cli.config`) is `local`. On docker / ssh / modal / daytona the host's database isn't the sandbox's, so statements are flagged by shape only.
 
 No network calls of its own, no files written, no data changed, nothing stored; the flagged SQL appears in the approval message. Not counted: statements with CTEs or joins (`USING`, `UPDATE … FROM`, multi-table) — those are still flagged by shape.
 

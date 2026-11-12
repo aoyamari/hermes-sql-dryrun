@@ -5,7 +5,8 @@
   session's ``transaction_read_only`` is checked with ``SHOW`` before any count
   runs, and the result is discarded if it isn't ``on``.
 * MySQL/MariaDB: the system ``mysql``/``mariadb`` inside
-  ``START TRANSACTION READ ONLY ... ROLLBACK``, with allowlisted connection flags only.
+  ``START TRANSACTION READ ONLY ... ROLLBACK``, with ``--no-defaults`` and allowlisted
+  connection flags only.
 
 Which binary runs: only a bare ``psql`` / ``mysql`` / ``mariadb`` token, resolved
 with ``shutil.which()`` and refused if it resolves inside the agent's working
@@ -32,6 +33,7 @@ from .parse import Finding
 
 _CLIENT_NAMES = {"postgres": {"psql"}, "mysql": {"mysql", "mariadb"}}
 _BASE_ENV = ("PATH", "HOME", "LANG", "TZ")
+UNSAFE_CHARS = (";", "\\")
 
 
 @dataclass
@@ -162,9 +164,10 @@ def _mysql(target: Target, client: str, total_q: str, where_q: Optional[str], ti
     if where_q:
         script += " " + where_q + ";"
     script += " ROLLBACK;"
-    conn = list(target.conn_args)
-    head = [conn.pop(0)] if conn and conn[0].startswith("--defaults-file=") else []
-    cmd = [client, *head, *conn, "--batch", "--skip-column-names", f"--execute={script}"]
+    # --no-defaults (must be first): option files can carry init-command=, which would run
+    # SQL before the read-only transaction starts.
+    cmd = [client, "--no-defaults", *target.conn_args, "--batch", "--skip-column-names",
+           f"--execute={script}"]
     try:
         cp = _run(cmd, minimal_env(target), timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -189,16 +192,16 @@ def count_rows(f: Finding, target: Optional[Target], timeout: float = 5.0) -> Co
     if f.kind == "DROP" and f.detail != "DROP TABLE":
         return Count(error="not counted (whole database/schema)")
     total_q, where_q = _count_queries(f)
+    # Raw check, independent of our lexer: the generated text must be one statement the
+    # server can't read differently than we did (Postgres ends a string at \', MySQL doesn't).
+    if any(ch in q for q in (total_q, where_q or "") for ch in UNSAFE_CHARS):
+        return Count(error="not counted: statement contains ';' or a backslash")
     if target.engine == "sqlite":
         c = _sqlite(target, total_q, where_q, timeout)
     elif target.engine in ("postgres", "mysql"):
         client, why = resolve_client(target)
         if client is None:
             return Count(error=f"not counted: {why}")
-        if target.engine == "mysql":
-            df = next((a.split("=", 1)[1] for a in target.conn_args if a.startswith("--defaults-file=")), None)
-            if df and any(_inside(os.path.realpath(df), os.path.realpath(d)) for d in target.tree if d):
-                return Count(error="not counted: --defaults-file is inside the working tree")
         runner = _postgres if target.engine == "postgres" else _mysql
         c = runner(target, client, total_q, where_q, timeout)
     else:

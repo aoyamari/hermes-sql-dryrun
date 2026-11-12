@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -28,6 +29,13 @@ from sql_dryrun_under_test.sqldryrun.extract import from_command, from_tool_call
 from sql_dryrun_under_test.sqldryrun.policy import Settings, assess_all, directive  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _local_backend(monkeypatch):
+    """Outside Hermes the backend is unknown (no counts); tests stub what config would say."""
+    monkeypatch.setattr(plugin, "_backend", lambda: os.environ.get("TEST_BACKEND", "local"))
+    monkeypatch.setattr(plugin, "_cwd", lambda: os.environ.get("TEST_CWD") or os.getcwd())
+
+
 @pytest.fixture()
 def shop(tmp_path, monkeypatch):
     db = tmp_path / "shop.db"
@@ -42,7 +50,7 @@ def shop(tmp_path, monkeypatch):
                       for i in range(1, 12851)])
     conn.commit()
     conn.close()
-    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    monkeypatch.setenv("TEST_CWD", str(tmp_path))
     return db
 
 
@@ -230,7 +238,7 @@ def test_client_on_path_inside_working_tree_is_refused(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{fake.parent}:/usr/bin:/bin")
     c = FakeCtx()
     plugin.register(c)
-    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    monkeypatch.setenv("TEST_CWD", str(tmp_path))
     d = hook(c, 'psql shop -c "DELETE FROM users"')
     assert d["action"] == "approve" and "no WHERE" in d["message"]   # still flagged by shape
     assert not marker.exists()                                          # the planted binary never ran
@@ -243,7 +251,7 @@ def test_sql_impact_tool_uses_same_client_rules(ctx, tmp_path, monkeypatch):
     fake = tmp_path / "mysql"
     fake.write_text(f"#!/bin/sh\ntouch {marker}\n")
     fake.chmod(0o755)
-    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    monkeypatch.setenv("TEST_CWD", str(tmp_path))
     out = json.loads(ctx.tools["sql_impact"]({"command": './mysql shop -e "DELETE FROM t WHERE id > 1"'}))
     assert "not counted" in out["statements"][0]["count_note"] and not marker.exists()
 
@@ -273,6 +281,7 @@ def test_env_prefix_pgoptions_is_not_taken():
 @pytest.mark.parametrize("cmd,reason", [
     ('mysql --init-command="SET autocommit=1" shop -e "DELETE FROM t"', "allowlist"),
     ('mysql --defaults-extra-file=x.cnf shop -e "DELETE FROM t"', "allowlist"),
+    ('mysql --defaults-file=/etc/mysql/app.cnf shop -e "DELETE FROM t"', "allowlist"),
     ('mysql -p shop -e "DELETE FROM t"', "password"),
     ("psql \"host=db dbname=shop options='-c default_transaction_read_only=off'\" -c \"DELETE FROM t\"",
      "options="),
@@ -304,9 +313,9 @@ def test_database_url_is_expanded(monkeypatch):
 
 
 # 4. only count on the local backend
-@pytest.mark.parametrize("backend", ["docker", "ssh", "modal", "daytona"])
+@pytest.mark.parametrize("backend", ["docker", "ssh", "modal", "daytona", "unknown"])
 def test_non_local_backend_flags_by_shape_only(shop, monkeypatch, backend):
-    monkeypatch.setenv("TERMINAL_ENV", backend)
+    monkeypatch.setenv("TEST_BACKEND", backend)
     c = FakeCtx()
     plugin.register(c)
     d = hook(c, "sqlite3 shop.db \"UPDATE users SET active=0\"")
@@ -314,3 +323,65 @@ def test_non_local_backend_flags_by_shape_only(shop, monkeypatch, backend):
     assert hook(c, "sqlite3 shop.db \"DELETE FROM orders WHERE created_at < '2030-01-01'\"") is None
     out = json.loads(c.tools["sql_impact"]({"sql": "DELETE FROM users WHERE id < 9", "sqlite_db": "shop.db"}))
     assert backend in out["statements"][0]["count_note"]
+
+
+# ── second review round ───────────────────────────────────────────────────
+
+from sql_dryrun_under_test.sqldryrun import count as count_mod  # noqa: E402
+from sql_dryrun_under_test.sqldryrun.policy import Settings as _S, assess as _assess  # noqa: E402
+
+
+def _never_run(*a, **k):
+    raise AssertionError("a database client was launched")
+
+
+@pytest.mark.parametrize("sql", [
+    "DELETE FROM t WHERE a = 'x\\' ; COMMIT; DELETE FROM users; --'",   # reviewer's case
+    "DELETE FROM t WHERE a = 'x;y'",
+    "UPDATE t SET b = 1 WHERE a = E'\\x41'",
+    "DELETE FROM t WHERE a LIKE 'c:\\temp%'",
+])
+@pytest.mark.parametrize("client", ["psql shop -c", "mysql shop -e", "sqlite3 shop.db"])
+def test_semicolon_or_backslash_is_never_counted(sql, client, shop, monkeypatch):
+    monkeypatch.setattr(count_mod, "_run", _never_run)
+    monkeypatch.setattr(count_mod, "_sqlite", _never_run)
+    src = from_command(f'{client} "{sql}"', str(shop.parent))
+    assert src, "statement should still be seen"
+    for a in [x for s_ in src for x in _assess(s_, _S())]:
+        assert a.count.affected is None
+        if a.finding.kind in ("DELETE", "UPDATE") and a.finding.has_where:
+            assert "not counted" in a.count.error or "no database" in a.count.error
+            assert a.flagged                                  # shape-flagged instead
+
+
+def test_escape_case_through_hook_asks_and_runs_nothing(ctx, shop, monkeypatch):
+    monkeypatch.setattr(count_mod, "_run", _never_run)
+    monkeypatch.setenv("TEST_CWD", str(shop.parent))
+    d = hook(ctx, "psql shop -c \"DELETE FROM t WHERE a = 'x\\' ; COMMIT; DELETE FROM users; --'\"")
+    assert d["action"] == "approve" and "backslash" in d["message"]
+
+
+def test_mysql_count_uses_no_defaults(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, env, timeout):
+        seen["cmd"] = cmd
+        import subprocess
+        return subprocess.CompletedProcess(cmd, 0, "10\n3\n", "")
+    monkeypatch.setattr(count_mod, "_run", fake_run)
+    monkeypatch.setattr(count_mod, "resolve_client", lambda t: ("/usr/bin/mysql", ""))
+    src = from_command('mysql -uroot shop -e "DELETE FROM t WHERE id < 4"', "/")[0]
+    a = _assess(src, _S())[0]
+    assert a.count.affected == 3 and seen["cmd"][1] == "--no-defaults"
+    assert not any(x.startswith("--defaults-file") for x in seen["cmd"])
+
+
+def test_no_private_hermes_imports():
+    src = (ROOT / "__init__.py").read_text()
+    assert "terminal_tool" not in src and "_task_env_overrides" not in src and "_qualify_task_key" not in src
+
+
+def test_backend_unknown_outside_hermes(monkeypatch):
+    monkeypatch.undo()                       # drop the autouse stub
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", None)
+    assert plugin._backend() == "unknown"

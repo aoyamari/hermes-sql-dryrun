@@ -259,14 +259,14 @@ def _parse_psql(args: List[str], client: str, assigns: Dict[str, str]) -> Option
 _MY_SHORT_VAL = {"-e": "sql", "-h": "--host", "-P": "--port", "-u": "--user", "-D": "--database",
                  "-S": "--socket"}
 _MY_LONG = {"--execute": "sql", "--host": "--host", "--port": "--port", "--user": "--user",
-            "--database": "--database", "--socket": "--socket", "--defaults-file": "--defaults-file"}
+            "--database": "--database", "--socket": "--socket"}
 _MY_BOOL = {"-N", "--skip-column-names", "-B", "--batch", "-s", "--silent", "-t", "--table", "-v",
             "--verbose", "-f", "--force", "-r", "--raw", "-E", "--vertical", "-n", "--unbuffered", "-q",
             "--quick", "--column-names"}
 
 
 def _parse_mysql(args: List[str], client: str, cwd: str, assigns: Dict[str, str]) -> Optional[SqlSource]:
-    sqls, conn, positional, why, defaults = [], [], [], "", None
+    sqls, conn, positional, why = [], [], [], ""
     # -p is optional-argument: only the attached form (-pSECRET) carries a value.
     cleaned = []
     for a in args:
@@ -300,8 +300,6 @@ def _parse_mysql(args: List[str], client: str, cwd: str, assigns: Dict[str, str]
             v, err = _expand(val, assigns)
             if v is None:
                 why = why or err
-            elif kind == "--defaults-file":
-                defaults = _resolve(v, cwd)
             else:
                 conn.append(f"{kind}={v}")
         else:
@@ -318,8 +316,6 @@ def _parse_mysql(args: List[str], client: str, cwd: str, assigns: Dict[str, str]
             why = why or "unexpected mysql argument"
         else:
             conn.append(f"--database={v}")
-    if defaults:
-        conn.insert(0, f"--defaults-file={defaults}")   # mysql requires it first
     env = {k: v for k, v in assigns.items() if allowed_env_key("mysql", k)}
     return SqlSource(sql="; ".join(sqls), origin=os.path.basename(client),
                      target=Target(engine="mysql", client=client, conn_args=conn, env=env, uncountable=why))

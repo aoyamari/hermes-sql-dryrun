@@ -6,7 +6,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .count import Count, count_rows
+from .count import UNSAFE_CHARS, Count, count_rows
 from .extract import SqlSource
 from .parse import Finding, analyze_sql
 
@@ -101,6 +101,9 @@ def assess(src: SqlSource, settings: Settings) -> List[Assessment]:
                     pct = f" ({c.affected / c.total:.1%} of the table)" if c.total else ""
                     r.append(f"{_n(c.affected)} rows would change in {what}{pct}, "
                              f"over the {settings.row_threshold:,}-row limit")
+            elif any(ch in f.statement for ch in UNSAFE_CHARS):
+                r.append("contains ';' or a backslash inside the statement — not counted, "
+                         "the database may read it as more than one statement")
             elif settings.flag_uncounted:
                 r.append(f"couldn't count affected rows ({c.error})")
         out.append(a)

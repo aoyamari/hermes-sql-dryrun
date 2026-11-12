@@ -1,5 +1,5 @@
 name: sql-dryrun
-version: 0.1.2
+version: 0.1.3
 description: "Shows how many rows a DELETE/UPDATE/DROP/TRUNCATE will touch before it runs, and asks for approval when it is too many — catches UPDATE without WHERE, WHERE 1=1, and WHERE clauses that match the whole table"
 author: Aoyama
 maintainer: Aoyama

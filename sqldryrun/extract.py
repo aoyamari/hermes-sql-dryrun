@@ -179,6 +179,16 @@ class _Args:
             i += 1
 
 
+def _unquote_all(v: str) -> str:
+    from urllib.parse import unquote
+    for _ in range(3):                      # nested encodings: %256F -> %6F -> o
+        nv = unquote(v)
+        if nv == v:
+            break
+        v = nv
+    return v
+
+
 _OPTIONS_KEY = re.compile(r"(?:^|[\s?&])options\s*=", re.I)
 _VAR_REF = re.compile(r"^\$(?:\{(\w+)\}|(\w+))$")
 
@@ -249,8 +259,11 @@ def _parse_psql(args: List[str], client: str, assigns: Dict[str, str]) -> Option
             why = why or "unexpected psql argument"
         else:
             conn.append(v)
-    if any(_OPTIONS_KEY.search(c.split("=", 1)[1] if c.startswith("--") else c) for c in conn):
-        why = why or "connection string sets options="
+    for c in conn:
+        val = c.split("=", 1)[1] if c.startswith("--") else c
+        # libpq percent-decodes URI keys, so check the decoded text too (%6Fptions=...).
+        if _OPTIONS_KEY.search(val) or _OPTIONS_KEY.search(_unquote_all(val)):
+            why = why or "connection string sets options="
     env = {k: v for k, v in assigns.items() if allowed_env_key("postgres", k)}
     return SqlSource(sql="; ".join(sqls), origin="psql",
                      target=Target(engine="postgres", client=client, conn_args=conn, env=env, uncountable=why))

@@ -385,3 +385,62 @@ def test_backend_unknown_outside_hermes(monkeypatch):
     monkeypatch.undo()                       # drop the autouse stub
     monkeypatch.setitem(sys.modules, "hermes_cli.config", None)
     assert plugin._backend() == "unknown"
+
+
+# ── self-audit: the WHERE runs before approval, so it must be a plain predicate ──
+
+from sql_dryrun_under_test.sqldryrun.parse import where_uncountable  # noqa: E402
+
+
+@pytest.mark.parametrize("where", [
+    "id = 7", "created_at < '2025-12-01'", "status IN ('a', 'b') AND total >= 10.5",
+    "id IN (SELECT user_id FROM orders WHERE status = 'refunded')",
+    "lower(email) LIKE '%@x.io' OR coalesce(active, 0) = 0",
+    "created_at < now() - interval '30 days'", "created_at < NOW() - INTERVAL 30 DAY",
+    "created_at < date('now', '-30 day')", "name = 'it''s (fine) INTO here'",
+    "EXISTS (SELECT 1 FROM users u WHERE u.id = orders.user_id)", 'u."Email" IS NULL',
+    "CAST(total AS numeric(10,2)) > 5", "id BETWEEN 1 AND 9", "name = \"O'Brien\"",
+])
+def test_plain_predicates_are_countable(where):
+    assert where_uncountable(where) == ""
+
+
+@pytest.mark.parametrize("where,why", [
+    ("1 INTO OUTFILE '/tmp/x'", "INTO"),
+    ("1 INTO DUMPFILE '/tmp/x'", "INTO"),
+    ("pg_reload_conf()", "pg_reload_conf"),
+    ("pg_terminate_backend(pid) AND true", "pg_terminate_backend"),
+    ("id = 1 AND set_config('application_name', 'x', false) IS NOT NULL", "set_config"),
+    ("id IN (SELECT a FROM dblink('host=evil', 'DELETE FROM t') AS r(a int))", "dblink"),
+    ("id IN (SELECT lo_export(1, '/tmp/x'))", "lo_export"),
+    ("pg_catalog.pg_sleep(60) IS NULL", "schema-qualified"),
+    ('"pg_reload_conf"()', "quoted function"),
+    ("`sys_exec`('id')", "quoted function"),
+    ("sleep(60)", "sleep"), ("load_file('/etc/passwd') IS NOT NULL", "LOAD_FILE"),
+    ("a = $$ ' $$ OR pg_reload_conf() --'", "$"),
+    ("a = 1 /*! INTO OUTFILE '/tmp/x' */", "comment"),
+    ("a = 'unterminated", "unterminated"),
+    ("id = 1 FOR UPDATE", "FOR UPDATE"),
+    ("a = \"x ' y\" OR pg_reload_conf() IS NOT NULL OR b = 'z'", "pg_reload_conf"),
+])
+def test_side_effecting_where_is_refused(where, why):
+    assert why.lower() in where_uncountable(where).lower()
+
+
+@pytest.mark.parametrize("client", ["psql shop -c", "mysql shop -e", "sqlite3 shop.db"])
+def test_side_effecting_where_never_reaches_a_database(client, shop, monkeypatch):
+    monkeypatch.setattr(count_mod, "_run", _never_run)
+    monkeypatch.setattr(count_mod, "_sqlite", _never_run)
+    for sql in ("DELETE FROM users WHERE pg_reload_conf()",
+                "DELETE FROM users WHERE 1 INTO OUTFILE '/tmp/x'"):
+        src = from_command(f'{client} "{sql}"', str(shop.parent))[0]
+        a = _assess(src, _S())[0]
+        assert a.count.affected is None and "not counted" in a.count.error
+
+
+@pytest.mark.parametrize("uri", [
+    "postgresql://db/shop?%6Fptions=-c%20x", "postgresql://db/shop?a=1&OPTIONS=-c%20x",
+    "postgresql://db/shop?%256Fptions=x", "host=db%20options=x",
+])
+def test_encoded_options_key_skips_the_count(uri):
+    assert "options=" in from_command(f'psql "{uri}" -c "DELETE FROM t"', "/")[0].target.uncountable

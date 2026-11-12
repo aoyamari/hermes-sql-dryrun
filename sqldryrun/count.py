@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from .extract import Target, allowed_env_key
-from .parse import Finding
+from .parse import Finding, where_uncountable
 
 _CLIENT_NAMES = {"postgres": {"psql"}, "mysql": {"mysql", "mariadb"}}
 _BASE_ENV = ("PATH", "HOME", "LANG", "TZ")
@@ -193,9 +193,15 @@ def count_rows(f: Finding, target: Optional[Target], timeout: float = 5.0) -> Co
         return Count(error="not counted (whole database/schema)")
     total_q, where_q = _count_queries(f)
     # Raw check, independent of our lexer: the generated text must be one statement the
-    # server can't read differently than we did (Postgres ends a string at \', MySQL doesn't).
+    # server can't read differently than we did (Postgres ends a string at backslash-quote, MySQL doesn't).
     if any(ch in q for q in (total_q, where_q or "") for ch in UNSAFE_CHARS):
         return Count(error="not counted: statement contains ';' or a backslash")
+    # The WHERE runs before the user approves anything, so it must be a plain predicate:
+    # a read-only transaction doesn't stop side-effecting functions or INTO OUTFILE.
+    if where_q:
+        why = where_uncountable(f.where)
+        if why:
+            return Count(error=f"not counted: {why}")
     if target.engine == "sqlite":
         c = _sqlite(target, total_q, where_q, timeout)
     elif target.engine in ("postgres", "mysql"):

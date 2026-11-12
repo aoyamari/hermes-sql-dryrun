@@ -357,3 +357,97 @@ DESTRUCTIVE_HINT = re.compile(
 
 def looks_destructive(text: str) -> bool:
     return bool(text) and bool(DESTRUCTIVE_HINT.search(text))
+
+
+# ── Is this WHERE safe to run before the user has approved anything? ──────
+#
+# The count executes model-written WHERE text ahead of the approval prompt, so
+# it must be a plain predicate: comparisons, AND/OR, IN/EXISTS subqueries and a
+# short list of pure built-in functions. A read-only transaction does not stop
+# pg_reload_conf(), pg_terminate_backend(), dblink_exec(), SELECT ... INTO
+# OUTFILE and friends, so anything outside the list means "don't count".
+
+_SQL_WORDS = {
+    "and", "or", "not", "in", "exists", "any", "all", "some", "select", "from", "where", "on", "as",
+    "values", "case", "when", "then", "else", "between", "like", "ilike", "is", "join", "using",
+    "union", "distinct", "by", "having", "limit", "offset", "over", "filter", "cast", "extract",
+    "interval", "row", "array", "escape", "similar", "to", "end", "null", "true", "false",
+}
+_PURE_FUNCS = {
+    # text
+    "lower", "upper", "length", "char_length", "character_length", "trim", "ltrim", "rtrim", "btrim",
+    "substr", "substring", "left", "right", "concat", "replace", "position", "strpos", "instr",
+    "lpad", "rpad", "reverse", "initcap",
+    # null / numeric
+    "coalesce", "nullif", "ifnull", "nvl", "abs", "round", "floor", "ceil", "ceiling", "mod",
+    "greatest", "least", "sign", "power",
+    # date / time
+    "now", "date", "time", "datetime", "julianday", "strftime", "date_trunc", "date_part",
+    "to_date", "to_timestamp", "to_char", "date_add", "date_sub", "datediff", "timestampdiff",
+    "year", "month", "day", "hour", "minute", "second", "curdate", "current_date",
+    "current_timestamp", "unix_timestamp", "from_unixtime", "age", "make_date",
+    # aggregates (inside subqueries)
+    "count", "sum", "min", "max", "avg",
+    # type names used with a length: varchar(10), numeric(10,2)
+    "varchar", "char", "character", "numeric", "decimal", "int", "integer", "bigint", "smallint",
+    "timestamp", "float", "double", "real", "text", "boolean", "bool",
+}
+_FORBIDDEN_WORDS = re.compile(r"\b(into|procedure|outfile|dumpfile|attach|pragma|call|do|execute|copy|load_file|"
+                              r"lock|share|for\s+update)\b", re.I)
+_CALL = re.compile(r"(?P<dot>\.\s*)?(?P<name>[A-Za-z_][\w]*)\s*\(")
+
+
+def _mask_quoted(text: str):
+    """Blank out '...', "..." and `...` regions (doubling is the only escape).
+
+    Callers must already have refused backslashes and '$', which is what makes
+    this agree with how SQLite, Postgres and MySQL all read the same text.
+    Returns (masked, ok) — ok is False for an unterminated quote.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in ("'", '"', "`"):
+            j = i + 1
+            while j < n:
+                if text[j] == c:
+                    if j + 1 < n and text[j + 1] == c:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            if j >= n:
+                return "", False
+            out.append(c + "_" * (j - i - 1) + c)
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), True
+
+
+def where_uncountable(where: Optional[str]) -> str:
+    """Reason this WHERE must not be executed for a count, or '' if it is a plain predicate."""
+    if not where:
+        return ""
+    if ";" in where or "\\" in where:
+        return "statement contains ';' or a backslash"
+    if "$" in where:
+        return "WHERE uses '$' (dollar quoting / parameters)"
+    if "/*" in where or "--" in where or "#" in where:
+        return "WHERE contains a comment marker"
+    masked, ok = _mask_quoted(where)
+    if not ok:
+        return "WHERE has an unterminated quote"
+    if re.search(r"[\"`]\s*\(", masked):
+        return "WHERE calls a quoted function name"
+    m = _FORBIDDEN_WORDS.search(masked)
+    if m:
+        return f"WHERE contains {m.group(1).upper()}"
+    for m in _CALL.finditer(masked):
+        name = m.group("name").lower()
+        if m.group("dot"):
+            return f"WHERE calls a schema-qualified function ({name})"
+        if name not in _SQL_WORDS and name not in _PURE_FUNCS:
+            return f"WHERE calls {name}(), which isn't on the pure-function list"
+    return ""
